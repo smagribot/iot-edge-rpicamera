@@ -34,7 +34,6 @@ namespace IoTEdgeRaspberryPiCamera
         };
 
         private readonly CompositeDisposable _compositeDisposable = new CompositeDisposable();
-        private IDisposable _timedUpdateDisposable;
 
         public Runner(ILogger logger,
             ISchedulerProvider schedulerProvider,
@@ -65,10 +64,10 @@ namespace IoTEdgeRaspberryPiCamera
                 .Subscribe(imgConfig =>
                     {
                         _logger.LogInformation(
-                            "Got new image config.");
+                            "Got new image config");
                         _currentImageConfig = imgConfig;
                     },
-                    err => { _logger.LogError($"Got error while listining for ImageConfig: {err}"); },
+                    err => { _logger.LogError("Got error while listining for ImageConfig: {Err}", err); },
                     () => { _logger.LogInformation("Listing for ImageConfig finished"); });
             _compositeDisposable.Add(imageConfigObservable);
         }
@@ -86,44 +85,61 @@ namespace IoTEdgeRaspberryPiCamera
                 .Merge(connectedObservable.Select(_ => TimeSpan.FromMinutes(15)))
                 .Where(timespan => timespan != _currentTimerInterval)
                 .Do(timespan => _currentTimerInterval = timespan)
+                .Do(timespan =>
+                    _logger.LogInformation(
+                        "Setup new interval for timelapse interval. Interval is {timespan.TotalMinutes} minutes",
+                        timespan.TotalMinutes))
+                .Select(StartIntervalledStatusUpdate)
+                .Switch()
                 .SubscribeOn(_schedulerProvider.NewThread)
-                .Subscribe(timespan =>
-                    {
-                        _logger.LogInformation(
-                            $"Setup new interval for timelapse interval. Interval is {timespan.TotalMinutes} minutes");
-                        StartIntervalledStatusUpdate(timespan);
-                    },
-                    err => { _logger.LogError($"Got error while listining for TimelapseConfig.Period: {err}"); },
-                    () => { _logger.LogInformation("Listing for TimelapseConfig.Period finished"); });
+                .Subscribe(_ => { _logger.LogInformation("Uploaded picture"); },
+                    err => { _logger.LogError("Uploaded picture interval got error: {Err}", err); },
+                    () => { _logger.LogInformation("Uploaded pictures interval finished"); });
 
             _compositeDisposable.Add(newIntervalObservable);
         }
 
-        private void StartIntervalledStatusUpdate(TimeSpan timespan)
+        private IObservable<Unit> StartIntervalledStatusUpdate(TimeSpan timespan)
         {
-            _timedUpdateDisposable?.Dispose();
-            _timedUpdateDisposable =  Observable.Interval(timespan, _schedulerProvider.NewThread)
+            return Observable.Interval(timespan, _schedulerProvider.NewThread)
                 .Merge(Observable.Return(0L))
-                .SelectMany(_ => _cameraService.TakePicture(_currentImageConfig))
+                .SelectMany(_ => TakePicture())
                 .Do(data => data.Seek(0, SeekOrigin.Begin))
                 .SelectMany(async data =>
                 {
-                    var fileName = new StringBuilder();
-                    fileName.Append($"{DateTime.UtcNow:yyyy-MM-dd_HH-mm-ss}");
-                    fileName.Append(_currentImageConfig.EncodingFormat == EncodingFormat.JPEG ? ".jpg" : ".bmp");
-                    await _blobService.Upload("timelapse", fileName.ToString(), data);
+                    var fileName = CreatePictueName();
+                    await using (data)
+                    {
+                        await _blobService.Upload("timelapse", fileName.ToString(), data);
+                    }
+
                     return Unit.Default;
-                })
-                .SubscribeOn(_schedulerProvider.NewThread)
-                .Subscribe(status => { _logger.LogInformation("Uploaded picture"); },
-                    err => { _logger.LogError($"Uploaded picture interval got error: {err}"); },
-                    () => { _logger.LogInformation("Uploaded pictures interval finished"); });
+                });
+        }
+
+        private IObservable<Stream> TakePicture()
+        {
+            return Observable.FromAsync(() => _cameraService.TakePicture(_currentImageConfig))
+                .RetryWhen(observable =>
+                    observable
+                        .Do(ex => _logger.LogWarning("TakePicture throw {Ex} trying again", ex))
+                        .Zip(Observable.Return(0).Delay(TimeSpan.FromSeconds(30), _schedulerProvider.NewThread),
+                            (exception, i) => i)
+                        .Do(_ => _logger.LogInformation("TakePicture trying again"))
+                );
+        }
+
+        private StringBuilder CreatePictueName()
+        {
+            var fileName = new StringBuilder();
+            fileName.Append($"{DateTime.UtcNow:yyyy-MM-dd_HH-mm-ss}");
+            fileName.Append(_currentImageConfig.EncodingFormat == EncodingFormat.JPEG ? ".jpg" : ".bmp");
+            return fileName;
         }
 
         public void Dispose()
         {
             _compositeDisposable?.Dispose();
-            _timedUpdateDisposable?.Dispose();
         }
     }
 }

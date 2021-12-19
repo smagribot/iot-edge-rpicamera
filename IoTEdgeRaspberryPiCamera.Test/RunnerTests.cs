@@ -13,6 +13,17 @@ namespace IoTEdgeRaspberryPiCamera.Test
 {
     public class RunnerTests
     {
+        public class TestStream : MemoryStream
+        {
+            public bool IsDisposed { get; private set; }
+            
+            protected override void Dispose(bool disposing)
+            {
+                base.Dispose(disposing);
+                IsDisposed = true;
+            }
+        }
+
         private readonly Runner _sut;
 
         private readonly TestSchedulerProvider _schedulerProvider = new TestSchedulerProvider();
@@ -23,20 +34,15 @@ namespace IoTEdgeRaspberryPiCamera.Test
 
         private readonly Subject<DesiredDeviceProperties> _devicePropertiesSubject =
             new Subject<DesiredDeviceProperties>();
-
-
-        private readonly Stream _testStream = new MemoryStream();
-
-
+        
         protected RunnerTests()
         {
             _cloudServiceMock.Setup(m => m.GetDesiredProperties())
                 .Returns(_devicePropertiesSubject);
-
-
+            
             _cameraServiceMock
                 .Setup(m => m.TakePicture(It.IsAny<ImageConfig>()))
-                .ReturnsAsync(_testStream);
+                .ReturnsAsync(() => new MemoryStream());
 
             _sut = new Runner(
                 _loggerMock.Object,
@@ -78,11 +84,28 @@ namespace IoTEdgeRaspberryPiCamera.Test
                         m.TakePicture(It.IsAny<ImageConfig>()),
                     Times.Exactly(3));
             }
+            
+            [Fact]
+            public void Should_retry_taking_picture_when_it_fails_after_30_sec()
+            {
+                _cameraServiceMock.Setup(m => m.TakePicture(It.IsAny<ImageConfig>()))
+                    .ThrowsAsync(new Exception());
+
+                _sut.Run();
+                _schedulerProvider.AdvanceTo(2);
+                _cameraServiceMock.Verify(m => m.TakePicture(It.IsAny<ImageConfig>()), Times.Exactly(1));
+                
+                _schedulerProvider.AdvanceBy(TimeSpan.FromSeconds(15).Ticks);
+                _cameraServiceMock.Verify(m => m.TakePicture(It.IsAny<ImageConfig>()), Times.Exactly(1));
+                
+                _schedulerProvider.AdvanceBy(TimeSpan.FromSeconds(15).Ticks);
+                _cameraServiceMock.Verify(m => m.TakePicture(It.IsAny<ImageConfig>()), Times.Exactly(2));
+            }
 
             [Fact]
-            public void Should_send_image_to_cloud()
+            public void Should_dispose_image_data()
             {
-                var testStream = new MemoryStream();
+                var testStream = new TestStream();
                 _cameraServiceMock
                     .Setup(m => m.TakePicture(It.IsAny<ImageConfig>()))
                     .ReturnsAsync(testStream);
@@ -90,15 +113,22 @@ namespace IoTEdgeRaspberryPiCamera.Test
                 _sut.Run();
 
                 _schedulerProvider.AdvanceTo(2);
+                Assert.True(testStream.IsDisposed);
             }
 
             [Fact]
             public void Should_upload_image_to_blob()
             {
+                var testStream = new MemoryStream();
+                
+                _cameraServiceMock
+                    .Setup(m => m.TakePicture(It.IsAny<ImageConfig>()))
+                    .ReturnsAsync(testStream);
+                
                 _sut.Run();
 
                 _schedulerProvider.AdvanceTo(2);
-                _blobServiceMock.Verify(m => m.Upload("timelapse", It.IsAny<string>(), _testStream), Times.Exactly(1));
+                _blobServiceMock.Verify(m => m.Upload("timelapse", It.IsAny<string>(), testStream), Times.Exactly(1));
             }
 
             [Fact]
